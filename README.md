@@ -1,0 +1,1 @@
+uh so idk what why are you here but this client is a client that look slop i know and use it at you own risk even if this client is a legit client because the client might accidentally give you a higher advantage then other player and if you find anybug contact me at chnkchnmphummi57@gmail.com
