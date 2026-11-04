@@ -1,0 +1,34 @@
+name: Build ombryn.dll
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get MinHook
+        run: git clone --depth 1 --branch v1.3.3 https://github.com/TsudaKageyu/minhook.git minhook
+      - name: Get Dear ImGui
+        run: git clone --depth 1 --branch v1.91.5 https://github.com/ocornut/imgui.git imgui
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build (x64)
+        shell: cmd
+        run: >
+          cl /LD /O2 /EHsc /std:c++17 /I minhook\include /I imgui
+          culling.cpp
+          minhook\src\buffer.c minhook\src\hook.c minhook\src\trampoline.c minhook\src\hde\hde64.c
+          imgui\imgui.cpp imgui\imgui_draw.cpp imgui\imgui_tables.cpp imgui\imgui_widgets.cpp
+          imgui\backends\imgui_impl_win32.cpp imgui\backends\imgui_impl_dx11.cpp imgui\backends\imgui_impl_dx12.cpp
+          user32.lib d3d11.lib d3d12.lib dxgi.lib /Fe:ombryn.dll
+      - name: Build injector
+        shell: cmd
+        run: cl /O2 /EHsc /std:c++17 injector.cpp user32.lib gdi32.lib comdlg32.lib /Fe:injector.exe /link /SUBSYSTEM:WINDOWS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ombryn
+          path: |
+            ombryn.dll
+            injector.exe
