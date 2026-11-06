@@ -20,6 +20,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -37,6 +38,7 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "d3d12.lib")
+#pragma comment(lib, "version.lib")
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
@@ -45,7 +47,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 // =====================================================================
 enum ModId {
     // Performance
-    M_ENTITY_CULL, M_UNDERGROUND_CULL, M_PARTICLE_CULL,
+    M_ENTITY_CULL, M_UNDERGROUND_CULL, M_PARTICLE_CULL, M_FPS_UNLOCK,
     // Combat
     M_HITBOX, M_JAVA_ANIM, M_NO_HURTCAM, M_SHORT_SWORDS, M_HIT_COLOR, M_PARTICLE_MULT,
     M_HITBOX_CHROMA, M_COMBO, M_REACH, M_TARGET_HUD,
@@ -84,6 +86,7 @@ static void InitModules() {
         {M_ENTITY_CULL, "Entity Culling", "Performance", true, true},
         {M_UNDERGROUND_CULL, "Underground Culling", "Performance", true, true},
         {M_PARTICLE_CULL, "Particle Culler", "Performance", true, false},
+        {M_FPS_UNLOCK, "FPS Unlocker", "Performance", false, false},
         {M_HITBOX, "Hitbox Viewer", "Combat", true, false},
         {M_JAVA_ANIM, "1.8 Java Animations", "Combat", true, false},
         {M_NO_HURTCAM, "NoHurtCam", "Combat", true, false},
@@ -138,6 +141,7 @@ struct Config {
     int   losMaxSteps       = 96;
     int   surfaceMargin     = 2;
     float particleMaxDistance = 24.0f;
+    int   fpsLimit = 0;                 // 0 = unlimited (FPS Unlocker)
     // visuals
     float blurStrength = 0.45f;
     float chromaSpeed  = 0.5f;
@@ -436,13 +440,25 @@ static void IniSetNum(const char* sec, const char* key, double v) {
 
 static bool IsLatchModule(int i) { return i == M_TOGGLE_SPRINT || i == M_TOGGLE_SNEAK; }
 
-static void LoadConfig() {
+// keepKeys = true: leave hotkeys / game keys as they are. Profile files only hold module
+// toggles and settings (SaveConfig never writes keys into them), so without this a profile
+// load would reset every hotkey you customised in ombryn.ini back to its default.
+static void LoadConfig(bool keepKeys = false) {
     Config c;  // defaults
+    if (keepKeys) {
+        c.keyMenu = g_cfg.keyMenu;           c.keyEntity = g_cfg.keyEntity;
+        c.keyUnderground = g_cfg.keyUnderground; c.keyReload = g_cfg.keyReload;
+        c.keyBorderless = g_cfg.keyBorderless;   c.keyTopmost = g_cfg.keyTopmost;
+        c.keyEject = g_cfg.keyEject;         c.keyToggleSprint = g_cfg.keyToggleSprint;
+        c.keyToggleSneak = g_cfg.keyToggleSneak; c.sprintKey = g_cfg.sprintKey;
+        c.sneakKey = g_cfg.sneakKey;         c.zoomKey = g_cfg.zoomKey;
+    }
     c.entityMaxDistance = IniFloat("culling", "entity_max_distance", c.entityMaxDistance);
     c.entityAlwaysShow  = IniFloat("culling", "entity_always_show", c.entityAlwaysShow);
     c.losMaxSteps       = IniInt("culling", "los_max_steps", c.losMaxSteps);
     c.surfaceMargin     = IniInt("culling", "surface_margin", c.surfaceMargin);
     c.particleMaxDistance = IniFloat("culling", "particle_max_distance", c.particleMaxDistance);
+    c.fpsLimit = IniInt("performance", "fps_limit", c.fpsLimit);
     c.blurStrength = IniFloat("visual", "blur_strength", c.blurStrength);
     c.chromaSpeed  = IniFloat("visual", "chroma_speed", c.chromaSpeed);
     c.zoomFov      = IniFloat("visual", "zoom_fov", c.zoomFov);
@@ -487,6 +503,7 @@ static void SaveConfig() {
     IniSetNum("culling", "los_max_steps", g_cfg.losMaxSteps);
     IniSetNum("culling", "surface_margin", g_cfg.surfaceMargin);
     IniSetNum("culling", "particle_max_distance", g_cfg.particleMaxDistance);
+    IniSetNum("performance", "fps_limit", g_cfg.fpsLimit);
     IniSetNum("visual", "blur_strength", g_cfg.blurStrength);
     IniSetNum("visual", "chroma_speed", g_cfg.chromaSpeed);
     IniSetNum("visual", "zoom_fov", g_cfg.zoomFov);
@@ -540,7 +557,7 @@ static void LoadProfile(const std::string& name) {
     std::string p = ProfilePath(name);
     if (GetFileAttributesA(p.c_str()) == INVALID_FILE_ATTRIBUTES) return;
     IniScope scope(p);
-    LoadConfig();
+    LoadConfig(true);
 }
 static std::vector<std::string> ListProfiles() {
     std::vector<std::string> out;
@@ -706,9 +723,15 @@ static bool IsGameFocused() {
     GetWindowThreadProcessId(f, &pid);
     if (pid == GetCurrentProcessId()) return true;
     if (g_hwnd && (f == g_hwnd || GetAncestor(g_hwnd, GA_ROOT) == f)) return true;
+    // UWP builds: the foreground window is an ApplicationFrameWindow owned by another process.
+    // Only that class may match by title, otherwise a browser tab called "Minecraft Wiki"
+    // would count as the game (hotkeys firing, clicks counted).
+    wchar_t cls[64] = {};
+    GetClassNameW(f, cls, 64);
+    if (wcscmp(cls, L"ApplicationFrameWindow") != 0) return false;
     wchar_t t[128] = {};
     GetWindowTextW(f, t, 128);
-    return wcsstr(t, L"Minecraft") != nullptr;  // UWP frame window
+    return wcsstr(t, L"Minecraft") != nullptr;
 }
 
 // DirectX 12 state (used only when the game renders with DX12)
@@ -733,6 +756,7 @@ static ID3D11ShaderResourceView* g_prevSrv = nullptr;
 static UINT g_prevW = 0, g_prevH = 0;
 static DXGI_FORMAT g_prevFmt = DXGI_FORMAT_UNKNOWN;
 static bool g_prevValid = false, g_blurFailed = false;
+static ImDrawList* g_blurList = nullptr;   // blur layer, rendered separately from the HUD (DX11 only)
 
 static void ReleasePrev() {
     if (g_prevSrv) { g_prevSrv->Release(); g_prevSrv = nullptr; }
@@ -940,11 +964,224 @@ static void DrawModuleList() {
     for (int i = 0; i < M_COUNT; ++i) {
         if (!ModActive((ModId)i)) continue;
         if (i == M_FPS || i == M_CPS || i == M_CLOCK || i == M_KEYSTROKES) continue;  // shown elsewhere
+        if (i == M_MOTION_BLUR && (g_api == 12 || g_blurFailed)) continue;  // can't run, don't list it
         hue += 0.06f;
         line(g_modules[i].name, TextCol(hue));
     }
     if (g_borderless) line("Borderless", TextCol(hue + 0.06f));
     if (g_topmost) line("Always On Top", TextCol(hue + 0.12f));
+}
+
+// =====================================================================
+// Hook Finder: tools to locate game functions from inside the running game.
+//   - "Find code that uses this text": finds a string in the game's memory, then every
+//     place in the code that references it, with the function start and a signature.
+//   - "Scan for signature": checks how many times a byte pattern appears (1 = good).
+// =====================================================================
+struct MemRegion { const uint8_t* p; size_t n; bool exec; };
+
+static std::vector<MemRegion> ReadableRegions(HMODULE mod = nullptr) {
+    std::vector<MemRegion> out;
+    const uint8_t* base = (const uint8_t*)(mod ? mod : GetModuleHandleW(nullptr));
+    if (!base) return out;
+    auto nt = (const IMAGE_NT_HEADERS*)(base + ((const IMAGE_DOS_HEADER*)base)->e_lfanew);
+    const uint8_t* end = base + nt->OptionalHeader.SizeOfImage;
+    const uint8_t* p = base;
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION mi{};
+        if (!VirtualQuery(p, &mi, sizeof mi)) break;
+        const uint8_t* rb = (const uint8_t*)mi.BaseAddress;
+        const uint8_t* re = rb + mi.RegionSize;
+        if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+            const uint8_t* s0 = rb < base ? base : rb;
+            const uint8_t* e0 = re > end ? end : re;
+            bool ex = (mi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                     PAGE_EXECUTE_WRITECOPY)) != 0;
+            if (e0 > s0) out.push_back({s0, (size_t)(e0 - s0), ex});
+        }
+        p = re > p ? re : p + 0x1000;
+    }
+    return out;
+}
+
+static std::string GameBuildInfo() {
+    const uint8_t* base = (const uint8_t*)GetModuleHandleW(nullptr);
+    if (!base) return "Game info unavailable.";
+    auto nt = (const IMAGE_NT_HEADERS*)(base + ((const IMAGE_DOS_HEADER*)base)->e_lfanew);
+    std::string ver = "unknown";
+    wchar_t exe[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
+        DWORD h = 0, sz = GetFileVersionInfoSizeW(exe, &h);
+        if (sz) {
+            std::vector<char> data(sz);
+            VS_FIXEDFILEINFO* fi = nullptr; UINT len = 0;
+            if (GetFileVersionInfoW(exe, 0, sz, data.data()) &&
+                VerQueryValueW(data.data(), L"\\", (LPVOID*)&fi, &len) && fi) {
+                char v[64];
+                snprintf(v, sizeof v, "%u.%u.%u.%u", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS),
+                         HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
+                ver = v;
+            }
+        }
+    }
+    char buf[256];
+    snprintf(buf, sizeof buf, "Game version: %s\nTimestamp: 0x%08X   Image size: 0x%X",
+             ver.c_str(), (unsigned)nt->FileHeader.TimeDateStamp, (unsigned)nt->OptionalHeader.SizeOfImage);
+    return buf;
+}
+
+static std::atomic<bool> g_hfBusy{false};
+static std::mutex g_hfMtx;
+static std::string g_hfOut = "Nothing yet. Pick a tool and press its button.";
+static void HfSet(const std::string& t) { std::lock_guard<std::mutex> l(g_hfMtx); g_hfOut = t; }
+static std::string HfGet() { std::lock_guard<std::mutex> l(g_hfMtx); return g_hfOut; }
+
+// First bytes of a function as a signature. Call and jump targets and RIP-relative
+// addresses become '?' so it survives small changes. Approximate; always test it.
+static std::string MakeSignature(const uint8_t* p, size_t avail) {
+    std::string out;
+    size_t n = avail < 28 ? avail : 28, i = 0;
+    auto add = [&](const char* t) { if (!out.empty()) out += ' '; out += t; };
+    char t[8];
+    while (i < n) {
+        uint8_t b = p[i];
+        if ((b == 0xE8 || b == 0xE9) && i + 5 <= n) {
+            snprintf(t, sizeof t, "%02X", b); add(t);
+            for (int k = 0; k < 4; ++k) add("?");
+            i += 5; continue;
+        }
+        size_t o = ((b & 0xF0) == 0x40 && i + 1 < n) ? i + 1 : i;
+        uint8_t op = p[o];
+        bool ripOp = op == 0x8B || op == 0x8D || op == 0x89 || op == 0x3B || op == 0x39 ||
+                     op == 0x03 || op == 0x2B || op == 0x63;
+        if (ripOp && o + 6 <= n && (p[o + 1] & 0xC7) == 0x05) {
+            for (size_t k = i; k <= o + 1; ++k) { snprintf(t, sizeof t, "%02X", p[k]); add(t); }
+            for (int k = 0; k < 4; ++k) add("?");
+            i = o + 6; continue;
+        }
+        snprintf(t, sizeof t, "%02X", b); add(t);
+        ++i;
+    }
+    return out;
+}
+
+static void FindRefsJob(std::string text, bool utf16) {
+    std::vector<uint8_t> needle;
+    for (char c : text) { needle.push_back((uint8_t)c); if (utf16) needle.push_back(0); }
+    if (needle.empty()) { HfSet("Type some text first."); g_hfBusy = false; return; }
+    auto regs = ReadableRegions();
+    const uint8_t* base = (const uint8_t*)GetModuleHandleW(nullptr);
+
+    // 1) find the text in data
+    std::vector<const uint8_t*> hits;
+    for (const MemRegion& r : regs) {
+        if (r.exec || r.n < needle.size()) continue;
+        size_t i = 0;
+        while (i + needle.size() <= r.n && hits.size() < 16) {
+            const void* f = memchr(r.p + i, needle[0], r.n - i - needle.size() + 1);
+            if (!f) break;
+            i = (size_t)((const uint8_t*)f - r.p);
+            bool startOk = utf16 ? (i < 2 || (r.p[i - 1] == 0 && r.p[i - 2] == 0)) : (i == 0 || r.p[i - 1] == 0);
+            if (startOk && !memcmp(r.p + i, needle.data(), needle.size())) hits.push_back(r.p + i);
+            ++i;
+        }
+    }
+    char line[256];
+    std::string out;
+    snprintf(line, sizeof line, "Text \"%s\"%s found %u time(s) as the start of a string.\n",
+             text.c_str(), utf16 ? " (UTF-16)" : "", (unsigned)hits.size());
+    out += line;
+    if (hits.empty()) {
+        out += "Try a shorter or different piece of text, or toggle UTF-16.";
+        HfSet(out); g_hfBusy = false; return;
+    }
+    // 2) find code that loads those addresses (LEA reg, [rip+disp32])
+    struct Ref { const uint8_t* instr; const uint8_t* target; const MemRegion* reg; };
+    std::vector<Ref> refs;
+    for (const MemRegion& r : regs) {
+        if (!r.exec) continue;
+        for (size_t i = 0; i + 7 <= r.n && refs.size() < 24; ++i) {
+            uint8_t b = r.p[i];
+            if ((b == 0x48 || b == 0x4C) && r.p[i + 1] == 0x8D && (r.p[i + 2] & 0xC7) == 0x05) {
+                int32_t d; memcpy(&d, r.p + i + 3, 4);
+                const uint8_t* tgt = r.p + i + 7 + d;
+                for (const uint8_t* h : hits) if (h == tgt) { refs.push_back({r.p + i, tgt, &r}); break; }
+            }
+        }
+    }
+    snprintf(line, sizeof line, "Found %u place(s) in the code that use it.\n\n", (unsigned)refs.size());
+    out += line;
+    int num = 0;
+    for (const Ref& rf : refs) {
+        const uint8_t* lo = rf.instr - 0x3000 < rf.reg->p ? rf.reg->p : rf.instr - 0x3000;
+        const uint8_t* fs = nullptr;
+        for (const uint8_t* q = rf.instr; q > lo; --q)
+            if (q[-1] == 0xCC && q[0] != 0xCC) { fs = q; break; }
+        snprintf(line, sizeof line, "#%d  used at RVA 0x%llX   (string at RVA 0x%llX)\n", ++num,
+                 (unsigned long long)(rf.instr - base), (unsigned long long)(rf.target - base));
+        out += line;
+        if (fs) {
+            size_t avail = (size_t)((rf.reg->p + rf.reg->n) - fs);
+            snprintf(line, sizeof line, "    function probably starts at RVA 0x%llX (%d bytes before)\n    signature: ",
+                     (unsigned long long)(fs - base), (int)(rf.instr - fs));
+            out += line;
+            out += MakeSignature(fs, avail) + "\n";
+        } else {
+            out += "    function start not found nearby\n";
+        }
+    }
+    Log("%s", out.c_str());
+    HfSet(out);
+    g_hfBusy = false;
+}
+
+static void SigTestJob(std::string sig) {
+    std::vector<int> pat;
+    size_t i = 0;
+    while (i < sig.size()) {
+        while (i < sig.size() && sig[i] == ' ') ++i;
+        size_t j = i;
+        while (j < sig.size() && sig[j] != ' ') ++j;
+        if (j > i) {
+            std::string tok = sig.substr(i, j - i);
+            pat.push_back(tok[0] == '?' ? -1 : (int)strtoul(tok.c_str(), nullptr, 16));
+        }
+        i = j;
+    }
+    size_t k = 0;
+    while (k < pat.size() && pat[k] < 0) ++k;
+    if (pat.empty() || k == pat.size()) { HfSet("Enter a signature like: 48 89 5C 24 ? 57 48 83 EC"); g_hfBusy = false; return; }
+
+    const uint8_t* base = (const uint8_t*)GetModuleHandleW(nullptr);
+    auto regs = ReadableRegions();
+    unsigned count = 0;
+    std::string firsts;
+    for (const MemRegion& r : regs) {
+        if (r.n < pat.size()) continue;
+        size_t pos0 = 0, last = r.n - pat.size();
+        while (pos0 <= last) {
+            const void* f = memchr(r.p + pos0 + k, pat[k], last - pos0 + 1);
+            if (!f) break;
+            size_t pos = (size_t)((const uint8_t*)f - (r.p + k));
+            bool ok = true;
+            for (size_t j = 0; j < pat.size(); ++j)
+                if (pat[j] >= 0 && r.p[pos + j] != (uint8_t)pat[j]) { ok = false; break; }
+            if (ok) {
+                if (++count <= 8) {
+                    char t[40]; snprintf(t, sizeof t, "  RVA 0x%llX\n", (unsigned long long)(r.p + pos - base));
+                    firsts += t;
+                }
+            }
+            pos0 = pos + 1;
+        }
+    }
+    char head[160];
+    snprintf(head, sizeof head, "Signature found %u time(s). %s\n", count,
+             count == 1 ? "Exactly one match: usable." : (count == 0 ? "No match." : "More than one match: make it longer."));
+    std::string out = head + firsts;
+    Log("%s", out.c_str());
+    HfSet(out);
+    g_hfBusy = false;
 }
 
 // Big Ombryn watermark + dimmed screen while the menu is open.
@@ -965,12 +1202,7 @@ static void DrawUI() {
     ImGuiIO& io = ImGui::GetIO();
     io.MouseDrawCursor = g_menuOpen;
 
-    // motion blur: draw the previous frame over this one
-    if (ModOn(M_MOTION_BLUR) && g_prevSrv && g_prevValid) {
-        int a = (int)(std::fmax(0.0f, std::fmin(0.9f, g_cfg.blurStrength)) * 255.0f);
-        ImGui::GetBackgroundDrawList()->AddImage((ImTextureID)(uintptr_t)g_prevSrv, ImVec2(0, 0), io.DisplaySize,
-                                                 ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, a));
-    }
+    // (motion blur is drawn as its own layer in RenderOverlayDx11, underneath everything here)
 
     // chroma accents for the menu
     static bool wasChroma = false;
@@ -1016,6 +1248,11 @@ static void DrawUI() {
                             ImGui::SameLine();
                             ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "(needs hook)");
                         }
+                        if (i == M_MOTION_BLUR && (g_api == 12 || g_blurFailed)) {
+                            ImGui::SameLine();
+                            ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1),
+                                               g_api == 12 ? "(DX11 only)" : "(unsupported backbuffer)");
+                        }
                     }
                 }
                 ImGui::EndChild();
@@ -1030,6 +1267,9 @@ static void DrawUI() {
                 ImGui::SliderInt("Surface margin", &g_cfg.surfaceMargin, 0, 10);
                 ImGui::SliderFloat("Particle max distance", &g_cfg.particleMaxDistance, 4.0f, 64.0f, "%.0f");
                 ImGui::Text("Entities culled: %u   Sections culled: %u", g_culledEntities.load(), g_culledSections.load());
+                ImGui::SeparatorText("Performance");
+                ImGui::SliderInt("FPS limit (0 = unlimited)", &g_cfg.fpsLimit, 0, 1000);
+                ImGui::TextDisabled("Turn on the FPS Unlocker module for this to apply.");
                 ImGui::SeparatorText("Visuals");
                 ImGui::SliderFloat("Motion blur strength", &g_cfg.blurStrength, 0.05f, 0.9f, "%.2f");
                 ImGui::SliderFloat("Chroma speed", &g_cfg.chromaSpeed, 0.1f, 3.0f, "%.1f");
@@ -1054,6 +1294,36 @@ static void DrawUI() {
                 ImGui::Checkbox("Title-bar status", &g_cfg.titleStatus);
                 ImGui::Checkbox("Beep on hotkey toggle", &g_cfg.beepOnToggle);
                 ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Hook Finder")) {
+                static std::string build = GameBuildInfo();
+                ImGui::TextWrapped("%s", build.c_str());
+                ImGui::Separator();
+                static char text[128] = "gfx_field_of_view";
+                static bool utf16 = false;
+                ImGui::InputText("Text in the game", text, sizeof text);
+                ImGui::Checkbox("UTF-16 text", &utf16);
+                ImGui::BeginDisabled(g_hfBusy.load());
+                if (ImGui::Button("Find code that uses this text")) {
+                    g_hfBusy = true; HfSet("Searching... (can take a few seconds)");
+                    std::string t = text; bool u = utf16;
+                    std::thread([t, u]() { FindRefsJob(t, u); }).detach();
+                }
+                static char sigBuf[256] = "";
+                ImGui::InputText("Signature", sigBuf, sizeof sigBuf);
+                if (ImGui::Button("Scan for signature")) {
+                    g_hfBusy = true; HfSet("Scanning...");
+                    std::string sg = sigBuf;
+                    std::thread([sg]() { SigTestJob(sg); }).detach();
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (ImGui::Button("Copy result")) ImGui::SetClipboardText(HfGet().c_str());
+                static char view[16384];
+                strncpy(view, HfGet().c_str(), sizeof view - 1);
+                view[sizeof view - 1] = 0;
+                ImGui::InputTextMultiline("##hfout", view, sizeof view, ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Profiles")) {
@@ -1148,9 +1418,29 @@ static void RenderOverlayDx11(IDXGISwapChain* sc) {
     ImGui::NewFrame();
     DrawUI();
     ImGui::Render();
+    ImDrawData* dd = ImGui::GetDrawData();
     g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+    // Motion blur. Layer 1: last frame's snapshot blended over the new game frame, drawn alone.
+    // Then the snapshot for the NEXT frame is taken, before the HUD/menu go on top. (Copying
+    // after the HUD, as before, fed the HUD back into the blur: FPS/CPS digits and keystroke
+    // boxes smeared and the HUD looked doubled.)  Still one ImGui frame per Present.
+    if (blur && g_prevSrv && g_prevValid) {
+        if (!g_blurList) g_blurList = IM_NEW(ImDrawList)(ImGui::GetDrawListSharedData());
+        int a = (int)(std::fmax(0.0f, std::fmin(0.9f, g_cfg.blurStrength)) * 255.0f);
+        g_blurList->_ResetForNewFrame();
+        g_blurList->PushClipRectFullScreen();
+        g_blurList->AddImage((ImTextureID)(uintptr_t)g_prevSrv, ImVec2(0, 0), dd->DisplaySize,
+                             ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, a));
+        ImDrawData layer;
+        layer.Valid = true;
+        layer.DisplayPos = dd->DisplayPos; layer.DisplaySize = dd->DisplaySize;
+        layer.FramebufferScale = dd->FramebufferScale; layer.OwnerViewport = dd->OwnerViewport;
+        layer.AddDrawList(g_blurList);
+        ImGui_ImplDX11_RenderDrawData(&layer);
+    }
     if (blur && g_prevTex) { g_ctx->CopyResource(g_prevTex, bb); g_prevValid = true; }
+    ImGui_ImplDX11_RenderDrawData(dd);  // HUD + menu
     rtv->Release();
     bb->Release();
 }
@@ -1286,15 +1576,38 @@ static PresentFn  g_origPresent  = nullptr;
 static Present1Fn g_origPresent1 = nullptr;
 static thread_local int t_presentDepth = 0;
 
+// FPS unlocker: turns VSync off when the game presents a frame, and optionally caps FPS itself.
+static void LimitFps() {
+    if (g_cfg.fpsLimit <= 0) return;
+    static LARGE_INTEGER freq = {}, last = {};
+    if (freq.QuadPart == 0) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&last); return; }
+    const double target = 1.0 / (double)g_cfg.fpsLimit;
+    for (;;) {
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        double dt = (double)(now.QuadPart - last.QuadPart) / (double)freq.QuadPart;
+        if (dt >= target) { last = now; break; }
+        if (target - dt > 0.002) Sleep(1); else YieldProcessor();
+    }
+}
+static void PrepPresent(IDXGISwapChain* sc, UINT& syncInterval, UINT& flags) {
+    if (!ModOn(M_FPS_UNLOCK)) return;
+    LimitFps();
+    if (flags & DXGI_PRESENT_TEST) return;
+    syncInterval = 0;  // no VSync
+    DXGI_SWAP_CHAIN_DESC d{};
+    if (SUCCEEDED(sc->GetDesc(&d)) && (d.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) && d.Windowed)
+        flags |= DXGI_PRESENT_ALLOW_TEARING;  // lets frames go past the monitor's refresh rate
+}
+
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* sc, UINT si, UINT fl) {
-    if (t_presentDepth == 0) { ++g_frames; RenderOverlay(sc); }
+    if (t_presentDepth == 0) { ++g_frames; RenderOverlay(sc); PrepPresent(sc, si, fl); }
     ++t_presentDepth;
     HRESULT hr = g_origPresent(sc, si, fl);
     --t_presentDepth;
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE HookedPresent1(IDXGISwapChain1* sc, UINT si, UINT fl, const DXGI_PRESENT_PARAMETERS* p) {
-    if (t_presentDepth == 0) { ++g_frames; RenderOverlay(sc); }
+    if (t_presentDepth == 0) { ++g_frames; RenderOverlay(sc); PrepPresent(sc, si, fl); }
     ++t_presentDepth;
     HRESULT hr = g_origPresent1(sc, si, fl, p);
     --t_presentDepth;
@@ -1305,14 +1618,14 @@ static HRESULT STDMETHODCALLTYPE HookedPresent1(IDXGISwapChain1* sc, UINT si, UI
 static PresentFn  g_origPresentB  = nullptr;
 static Present1Fn g_origPresent1B = nullptr;
 static HRESULT STDMETHODCALLTYPE HookedPresentB(IDXGISwapChain* sc, UINT si, UINT fl) {
-    if (t_presentDepth == 0) { ++g_frames; RenderOverlay(sc); }
+    if (t_presentDepth == 0) { ++g_frames; RenderOverlay(sc); PrepPresent(sc, si, fl); }
     ++t_presentDepth;
     HRESULT hr = g_origPresentB(sc, si, fl);
     --t_presentDepth;
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE HookedPresent1B(IDXGISwapChain1* sc, UINT si, UINT fl, const DXGI_PRESENT_PARAMETERS* p) {
-    if (t_presentDepth == 0) { ++g_frames; RenderOverlay(sc); }
+    if (t_presentDepth == 0) { ++g_frames; RenderOverlay(sc); PrepPresent(sc, si, fl); }
     ++t_presentDepth;
     HRESULT hr = g_origPresent1B(sc, si, fl, p);
     --t_presentDepth;
@@ -1373,31 +1686,65 @@ static bool GetPresentAddrs(void** present, void** present1) {
 // Game hooks (YOU fill these in, per game version)
 // =====================================================================
 // Signature scanner: pattern like "48 8B ? ? 89", '?' = wildcard.
-static uint8_t* FindPattern(HMODULE mod, const char* pattern) {
-    auto base = (uint8_t*)mod;
-    auto dos = (IMAGE_DOS_HEADER*)base;
-    auto nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-    size_t size = nt->OptionalHeader.SizeOfImage;
+// Scans only the module's EXECUTABLE pages that are really readable (the old version walked
+// the whole image blindly and could fault on a NOACCESS page), and only returns a match that
+// is UNIQUE: hooking the first of several matches would hook the wrong function.
+static std::vector<int> ParsePattern(const char* pattern) {
     std::vector<int> bytes;
     for (const char* p = pattern; *p;) {
         if (*p == ' ') { ++p; continue; }
         if (*p == '?') { bytes.push_back(-1); while (*p == '?') ++p; }
-        else { bytes.push_back((int)strtoul(p, nullptr, 16)); p += 2; }
+        else {
+            char* end = nullptr;
+            unsigned long v = strtoul(p, &end, 16);
+            if (end == p || v > 0xFF) return {};   // not a hex byte: reject the whole pattern
+            bytes.push_back((int)v);
+            p = end;
+        }
     }
-    for (size_t i = 0; i + bytes.size() < size; ++i) {
-        size_t j = 0;
-        while (j < bytes.size() && (bytes[j] == -1 || base[i + j] == bytes[j])) ++j;
-        if (j == bytes.size()) return base + i;
+    return bytes;
+}
+// Counts matches of pat (-1 = wildcard) inside [p, p+n); remembers the first one.
+static void ScanBuffer(const uint8_t* p, size_t n, const std::vector<int>& pat,
+                       const uint8_t** first, unsigned* hits) {
+    size_t k = 0;
+    while (k < pat.size() && pat[k] < 0) ++k;
+    if (k == pat.size() || n < pat.size()) return;   // empty / all wildcards / too short
+    size_t last = n - pat.size(), pos0 = 0;
+    while (pos0 <= last) {
+        const void* f = memchr(p + pos0 + k, pat[k], last - pos0 + 1);
+        if (!f) break;
+        size_t pos = (size_t)((const uint8_t*)f - (p + k));
+        bool ok = true;
+        for (size_t j = 0; j < pat.size(); ++j)
+            if (pat[j] >= 0 && p[pos + j] != (uint8_t)pat[j]) { ok = false; break; }
+        if (ok) { if (!*first) *first = p + pos; ++*hits; }
+        pos0 = pos + 1;
     }
-    return nullptr;
+}
+static uint8_t* FindPattern(HMODULE mod, const char* pattern) {
+    std::vector<int> pat = ParsePattern(pattern);
+    if (pat.empty()) { Log("FindPattern: bad pattern \"%s\"", pattern); return nullptr; }
+    const uint8_t* first = nullptr;
+    unsigned hits = 0;
+    for (const MemRegion& r : ReadableRegions(mod))
+        if (r.exec) ScanBuffer(r.p, r.n, pat, &first, &hits);
+    if (hits != 1) {
+        Log("FindPattern: \"%s\" matched %u times (need exactly 1)", pattern, hits);
+        return nullptr;
+    }
+    return (uint8_t*)first;
 }
 // Finds a function by signature and hooks it. The module flips to active the first
 // time your detour calls its API function above (e.g. ShouldCullEntity).
 static bool InstallHook(const char* pattern, void* detour, void** original) {
     uint8_t* target = FindPattern(GetModuleHandleA(nullptr), pattern);
     if (!target) return false;
-    if (MH_CreateHook(target, detour, original) != MH_OK) return false;
-    return MH_EnableHook(target) == MH_OK;
+    MH_STATUS st = MH_CreateHook(target, detour, original);
+    if (st != MH_OK) { Log("InstallHook: MH_CreateHook %p -> %s", (void*)target, MH_StatusToString(st)); return false; }
+    st = MH_EnableHook(target);
+    Log("InstallHook: %p -> %s", (void*)target, MH_StatusToString(st));
+    return st == MH_OK;
 }
 
 // Example detour (copy the real signature from the function you found):
@@ -1504,6 +1851,7 @@ static void FlipModule(ModId id) {
 static DWORD WINAPI Worker(LPVOID mod) {
     Sleep(2000);  // let the game finish loading
     Log("worker started");
+    timeBeginPeriod(1);  // accurate Sleep(1) for the FPS limiter
     if (!InitHooks()) {
         ShowMsg("Ombryn: hook setup failed. See ombryn.log.");
         g_running = false;
@@ -1583,6 +1931,7 @@ static DWORD WINAPI Worker(LPVOID mod) {
         GetWindowLongPtrW(g_hwnd, GWLP_WNDPROC) == (LONG_PTR)HookedWndProc)
         SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
     Sleep(300);  // let in-flight hooked calls finish
+    for (int w = 0; w < 50 && g_hfBusy.load(); ++w) Sleep(100);  // let a running Hook Finder scan end
     ReleasePrev();
     if (g_imguiInit) {
         if (g_api == 12) {
@@ -1598,6 +1947,7 @@ static DWORD WINAPI Worker(LPVOID mod) {
             ImGui_ImplDX11_Shutdown();
         }
         ImGui_ImplWin32_Shutdown();
+        if (g_blurList) { IM_DELETE(g_blurList); g_blurList = nullptr; }
         ImGui::DestroyContext();
         g_imguiInit = false;
     }
@@ -1612,6 +1962,7 @@ static DWORD WINAPI Worker(LPVOID mod) {
     if (g_dev12) { g_dev12->Release(); g_dev12 = nullptr; }
     if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
     if (g_dev) { g_dev->Release(); g_dev = nullptr; }
+    timeEndPeriod(1);
     MH_Uninitialize();
     FreeLibraryAndExitThread((HMODULE)mod, 0);
     return 0;
