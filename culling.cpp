@@ -1651,6 +1651,11 @@ static bool GetPresentAddrs(void** present, void** present1) {
     RegisterClassExA(&wc);
     HWND hw = CreateWindowExA(0, wc.lpszClassName, "", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100,
                               nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hw) {
+        Log("DX11 probe: CreateWindowExA failed with Win32 error %lu", GetLastError());
+        UnregisterClassA(wc.lpszClassName, wc.hInstance);
+        return false;
+    }
     DXGI_SWAP_CHAIN_DESC sd{};
     sd.BufferCount = 1;
     sd.BufferDesc.Width = 100; sd.BufferDesc.Height = 100;
@@ -1665,6 +1670,7 @@ static bool GetPresentAddrs(void** present, void** present1) {
     HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &fl, 1,
                                                D3D11_SDK_VERSION, &sd, &sc, &dev, nullptr, &ctx);
     bool ok = SUCCEEDED(hr) && sc;
+    Log("DX11 probe: D3D11CreateDeviceAndSwapChain hr=0x%08X swapchain=%p", (unsigned)hr, sc);
     if (ok) {
         void** vt = *(void***)sc;
         *present = vt[8];
@@ -1764,7 +1770,11 @@ static bool InstallHook(const char* pattern, void* detour, void** original) {
 // Same trick for DirectX 12: dummy device + queue + swapchain, read the vtable addresses.
 static bool GetDx12Addrs(void** present, void** present1, void** exec) {
     ID3D12Device* dev = nullptr;
-    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev))) || !dev) return false;
+    HRESULT deviceHr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev));
+    if (FAILED(deviceHr) || !dev) {
+        Log("DX12 probe: D3D12CreateDevice hr=0x%08X", (unsigned)deviceHr);
+        return false;
+    }
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     ID3D12CommandQueue* q = nullptr;
@@ -1778,8 +1788,14 @@ static bool GetDx12Addrs(void** present, void** present1, void** exec) {
     RegisterClassExA(&wc);
     HWND hw = CreateWindowExA(0, wc.lpszClassName, "", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100,
                               nullptr, nullptr, wc.hInstance, nullptr);
-    if (SUCCEEDED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) && q &&
-        SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&fac))) && fac) {
+    if (!hw) {
+        Log("DX12 probe: CreateWindowExA failed with Win32 error %lu", GetLastError());
+    }
+    HRESULT queueHr = hw ? dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q)) : E_FAIL;
+    HRESULT factoryHr = (SUCCEEDED(queueHr) && q) ? CreateDXGIFactory1(IID_PPV_ARGS(&fac)) : E_FAIL;
+    if (FAILED(queueHr) || !q) Log("DX12 probe: CreateCommandQueue hr=0x%08X", (unsigned)queueHr);
+    if (FAILED(factoryHr) || !fac) Log("DX12 probe: CreateDXGIFactory1 hr=0x%08X", (unsigned)factoryHr);
+    if (SUCCEEDED(queueHr) && q && SUCCEEDED(factoryHr) && fac) {
         DXGI_SWAP_CHAIN_DESC sd{};
         sd.BufferCount = 2;
         sd.BufferDesc.Width = 100; sd.BufferDesc.Height = 100;
@@ -1789,7 +1805,9 @@ static bool GetDx12Addrs(void** present, void** present1, void** exec) {
         sd.SampleDesc.Count = 1;
         sd.Windowed = TRUE;
         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        if (SUCCEEDED(fac->CreateSwapChain(q, &sd, &sc)) && sc) {
+        HRESULT swapHr = fac->CreateSwapChain(q, &sd, &sc);
+        if (FAILED(swapHr) || !sc) Log("DX12 probe: CreateSwapChain hr=0x%08X", (unsigned)swapHr);
+        if (SUCCEEDED(swapHr) && sc) {
             *present = (*(void***)sc)[8];
             IDXGISwapChain1* sc1 = nullptr;
             if (SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&sc1)) && sc1) {
@@ -1815,19 +1833,34 @@ static bool InitHooks() {
     bool ok11 = GetPresentAddrs(&pr, &pr1);
     bool ok12 = GetDx12Addrs(&pr12, &pr112, &ex12);
     Log("dummy swapchains: dx11=%d (%p %p)  dx12=%d (%p %p exec %p)", ok11, pr, pr1, ok12, pr12, pr112, ex12);
-    if (!ok11 && !ok12) g_uiStatus = 3;
-    auto hook = [](void* target, void* detour, void** original) {
-        if (!target) return;
+    int presentHooks = 0;
+    auto hook = [&presentHooks](const char* name, void* target, void* detour, void** original) {
+        if (!target) { Log("hook %s unavailable (no target address)", name); return false; }
         MH_STATUS st = MH_CreateHook(target, detour, original);
-        Log("hook %p -> %s", target, MH_StatusToString(st));
+        Log("hook %s at %p -> %s", name, target, MH_StatusToString(st));
+        if (st == MH_OK && (strstr(name, "Present") != nullptr)) ++presentHooks;
+        return st == MH_OK;
     };
-    hook(pr,  (void*)&HookedPresent,  (void**)&g_origPresent);
-    hook(pr1, (void*)&HookedPresent1, (void**)&g_origPresent1);
-    if (pr12  && pr12  != pr)  hook(pr12,  (void*)&HookedPresentB,  (void**)&g_origPresentB);
-    if (pr112 && pr112 != pr1) hook(pr112, (void*)&HookedPresent1B, (void**)&g_origPresent1B);
-    hook(ex12, (void*)&HookedExec, (void**)&g_origExec);
+    hook("DX11 Present", pr, (void*)&HookedPresent, (void**)&g_origPresent);
+    hook("DX11 Present1", pr1, (void*)&HookedPresent1, (void**)&g_origPresent1);
+    if (pr12 && pr12 != pr) hook("DX12 Present", pr12, (void*)&HookedPresentB, (void**)&g_origPresentB);
+    if (pr112 && pr112 != pr1) hook("DX12 Present1", pr112, (void*)&HookedPresent1B, (void**)&g_origPresent1B);
+    hook("DX12 ExecuteCommandLists", ex12, (void*)&HookedExec, (void**)&g_origExec);
+    if (presentHooks == 0) {
+        g_uiStatus = 3;
+        Log("hook setup failed: no DXGI Present entry point could be hooked");
+        MH_Uninitialize();
+        return false;
+    }
     MH_STATUS en = MH_EnableHook(MH_ALL_HOOKS);
     Log("MH_EnableHook(all) -> %s", MH_StatusToString(en));
+    if (en != MH_OK) {
+        g_uiStatus = 3;
+        Log("hook setup failed while enabling DXGI hooks");
+        MH_DisableHook(MH_ALL_HOOKS);
+        MH_Uninitialize();
+        return false;
+    }
     // --- your game hooks go here (see the example above) ---
     (void)FindPattern; (void)InstallHook;
     return true;
@@ -1855,8 +1888,9 @@ static DWORD WINAPI Worker(LPVOID mod) {
     if (!InitHooks()) {
         ShowMsg("Ombryn: hook setup failed. See ombryn.log.");
         g_running = false;
+    } else {
+        Beep(880, 120);  // one beep = at least one Present hook is enabled
     }
-    Beep(880, 120);  // one beep = the DLL is loaded and hooks are installed
     ULONGLONG startTick = GetTickCount64();
     bool warned = false;
 
